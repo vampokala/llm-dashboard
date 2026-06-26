@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM Benchmark Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1><span class="dot" id="statusDot"></span> LLM Benchmark Dashboard</h1>
+    <span class="status-pill" id="connectionStatus">Connecting…</span>
+  </header>
+
+  <div class="layout">
+    <!-- ── Controls ── -->
+    <aside class="sidebar">
+      <div class="field">
+        <label for="modelSelect">Model</label>
+        <select id="modelSelect"><option value="">Loading models…</option></select>
+      </div>
+
+      <div id="modelMeta" class="panel hidden">
+        <div class="panel-body" style="padding:0.6rem 0.8rem;font-size:0.8rem;color:var(--muted);">
+          <span id="metaParams"></span> · <span id="metaQuant"></span> · <span id="metaSize"></span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="promptInput">Prompt</label>
+        <div class="preset-btns" style="margin-bottom:0.4rem;">
+          <button type="button" data-preset="short">Short</button>
+          <button type="button" data-preset="essay">Essay</button>
+          <button type="button" data-preset="code">Code</button>
+          <button type="button" data-preset="reason">Reasoning</button>
+        </div>
+        <textarea id="promptInput" placeholder="Enter your benchmark prompt…">Write a concise paragraph explaining how local LLM inference throughput is measured.</textarea>
+      </div>
+
+      <div class="row-2">
+        <div class="field">
+          <label for="numPredict">Max Tokens</label>
+          <input type="number" id="numPredict" value="128" min="1" max="4096" />
+        </div>
+        <div class="field">
+          <label for="temperature">Temperature</label>
+          <div class="range-row">
+            <input type="range" id="temperature" min="0" max="20" value="7" />
+            <span class="range-val" id="tempVal">0.7</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="warmupCheck" checked />
+        <label for="warmupCheck">Warm-up run (load model first, excludes load time)</label>
+      </div>
+
+      <button class="btn btn-primary" id="runBtn" disabled>▶ Run Benchmark</button>
+    </aside>
+
+    <!-- ── Results ── -->
+    <main class="main">
+      <!-- System stats -->
+      <div class="sys-bar" id="sysBar">
+        <div class="sys-card"><div class="label">Memory Used</div><div class="value" id="memUsed">—</div></div>
+        <div class="sys-card"><div class="label">Memory Available</div><div class="value accent" id="memAvail">—</div></div>
+        <div class="sys-card"><div class="label">CPU</div><div class="value" id="cpuPct">—</div></div>
+        <div class="sys-card"><div class="label">Swap</div><div class="value" id="swapUsed">—</div></div>
+        <div class="sys-card"><div class="label">Ollama</div><div class="value" id="ollamaVer">—</div></div>
+        <div class="sys-card">
+          <div class="label">Loaded Models</div>
+          <div class="running-list" id="runningModels" style="margin-top:0.3rem;"><span class="running-badge none">none</span></div>
+        </div>
+      </div>
+
+      <!-- Key metrics -->
+      <div class="metrics-grid" id="metricsGrid">
+        <div class="metric-card highlight">
+          <div class="metric-label">Generation Speed</div>
+          <div class="metric-value" id="mEvalTps">—</div>
+          <div class="metric-unit">tokens / sec</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Prompt Speed</div>
+          <div class="metric-value" id="mPromptTps">—</div>
+          <div class="metric-unit">tokens / sec</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Load Time</div>
+          <div class="metric-value" id="mLoad">—</div>
+          <div class="metric-unit">seconds</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Time to First Token</div>
+          <div class="metric-value" id="mTtft">—</div>
+          <div class="metric-unit">seconds</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Tokens Generated</div>
+          <div class="metric-value" id="mEvalCount">—</div>
+          <div class="metric-unit" id="mPromptCount">prompt: —</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Total Duration</div>
+          <div class="metric-value" id="mTotal">—</div>
+          <div class="metric-unit">seconds</div>
+        </div>
+      </div>
+
+      <!-- Response -->
+      <div class="panel">
+        <div class="panel-header">Model Response</div>
+        <div class="panel-body">
+          <div class="response-box empty" id="responseBox">Run a benchmark to see the model output here.</div>
+        </div>
+      </div>
+
+      <!-- Detail breakdown -->
+      <div class="detail-grid">
+        <div class="panel">
+          <div class="panel-header">Timing Breakdown</div>
+          <div class="panel-body">
+            <table class="detail-table" id="timingTable">
+              <tbody>
+                <tr><td>Load duration</td><td>—</td></tr>
+                <tr><td>Prompt eval duration</td><td>—</td></tr>
+                <tr><td>Generation duration</td><td>—</td></tr>
+                <tr><td>Wall clock</td><td>—</td></tr>
+                <tr><td>Done reason</td><td>—</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">Model Parameters</div>
+          <div class="panel-body">
+            <table class="detail-table" id="modelTable">
+              <tbody>
+                <tr><td>Parameter size</td><td>—</td></tr>
+                <tr><td>Quantization</td><td>—</td></tr>
+                <tr><td>Family</td><td>—</td></tr>
+                <tr><td>Context length</td><td>—</td></tr>
+                <tr><td>Disk size</td><td>—</td></tr>
+                <tr><td>Digest</td><td>—</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Model insights -->
+      <div class="panel" id="insightsPanel">
+        <div class="panel-header">
+          Model Insights
+          <div class="insights-header-right">
+            <span class="rating-legend">
+              <span class="rating-badge best">Best</span>
+              <span class="rating-badge expected">Expected</span>
+              <span class="rating-badge poor">Poor</span>
+            </span>
+            <span class="insights-runs" id="insightsRuns">0 runs</span>
+          </div>
+        </div>
+        <div class="panel-body">
+          <p class="insights-summary" id="insightsSummary">Run benchmarks with different settings to see what works best for this model.</p>
+
+          <div class="insights-section">
+            <div class="insights-section-title">Observed Ranges</div>
+            <div class="range-grid" id="rangeGrid">
+              <div class="range-card empty-state">No data yet</div>
+            </div>
+          </div>
+
+          <div class="insights-section">
+            <div class="insights-section-title">Parameter Performance</div>
+            <div class="param-grid" id="paramGrid">
+              <div class="param-card empty-state">Adjust temperature and max tokens across runs to compare</div>
+            </div>
+          </div>
+
+          <div class="insights-section" id="bestRunSection" style="display:none;">
+            <div class="insights-section-title">Best Run</div>
+            <div class="best-run-card" id="bestRunCard"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Chart -->
+      <div class="panel">
+        <div class="panel-header">
+          Throughput Comparison
+          <button class="btn btn-ghost" id="clearHistoryBtn">Clear History</button>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="throughputChart"></canvas>
+        </div>
+      </div>
+
+      <!-- History table -->
+      <div class="panel">
+        <div class="panel-header">Benchmark History</div>
+        <div class="panel-body" style="padding:0;overflow-x:auto;">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Model</th>
+                <th>Temp</th>
+                <th>Max Tok</th>
+                <th>Gen tok/s</th>
+                <th>Prompt tok/s</th>
+                <th>Tokens</th>
+                <th>Load (s)</th>
+                <th>Total (s)</th>
+              </tr>
+            </thead>
+            <tbody id="historyBody">
+              <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:1.5rem;font-family:var(--font);">No benchmarks yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <div class="loading-text" id="loadingText">Running benchmark…</div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
