@@ -7,6 +7,11 @@ const PRESETS = {
   reason: "A farmer has 17 sheep. All but 9 die. How many are left? Explain your reasoning step by step.",
 };
 
+const PROVIDER_LABELS = {
+  ollama: "Ollama",
+  lmstudio: "LM Studio",
+};
+
 let models = [];
 let chart = null;
 
@@ -64,18 +69,31 @@ async function api(path, opts = {}) {
 // ── Refresh ──
 async function refreshAll() {
   try {
-    await api("/api/health");
-    setConnection(true);
+    const health = await api("/api/health");
+    setConnection(health);
     await Promise.all([loadModels(), refreshSystem(), loadHistory(), loadInsights()]);
-    runBtn.disabled = false;
+    runBtn.disabled = models.length === 0;
   } catch {
-    setConnection(false);
+    setConnection(null);
     runBtn.disabled = true;
   }
 }
 
-function setConnection(ok) {
-  connectionStatus.textContent = ok ? "Ollama connected" : "Ollama offline";
+function setConnection(health) {
+  if (!health) {
+    connectionStatus.textContent = "Backends offline";
+    connectionStatus.className = "status-pill err";
+    statusDot.style.background = "var(--danger)";
+    statusDot.style.boxShadow = "0 0 8px var(--danger)";
+    return;
+  }
+
+  const parts = [];
+  if (health.ollama) parts.push("Ollama");
+  if (health.lmstudio) parts.push("LM Studio");
+
+  const ok = parts.length > 0;
+  connectionStatus.textContent = ok ? `${parts.join(" + ")} connected` : "Backends offline";
   connectionStatus.className = `status-pill ${ok ? "ok" : "err"}`;
   statusDot.style.background = ok ? "var(--accent)" : "var(--danger)";
   statusDot.style.boxShadow = ok ? "0 0 8px var(--accent)" : "0 0 8px var(--danger)";
@@ -85,14 +103,26 @@ async function loadModels() {
   const data = await api("/api/models");
   models = data.models || [];
   modelSelect.innerHTML = models.length
-    ? models.map((m) => `<option value="${m.name}">${m.name}</option>`).join("")
+    ? models
+        .map((m) => {
+          const label = `[${PROVIDER_LABELS[m.provider] || m.provider}] ${m.display_name || m.name}`;
+          return `<option value="${m.name}" data-provider="${m.provider}">${label}</option>`;
+        })
+        .join("")
     : '<option value="">No models installed</option>';
   updateModelMeta();
 }
 
+function selectedModel() {
+  const option = modelSelect.selectedOptions[0];
+  if (!option) return null;
+  const name = option.value;
+  const provider = option.dataset.provider || "ollama";
+  return models.find((x) => x.name === name && x.provider === provider) || null;
+}
+
 function updateModelMeta() {
-  const name = modelSelect.value;
-  const m = models.find((x) => x.name === name);
+  const m = selectedModel();
   const meta = $("#modelMeta");
   if (!m) { meta.classList.add("hidden"); return; }
   meta.classList.remove("hidden");
@@ -113,12 +143,21 @@ async function refreshSystem() {
     $("#cpuPct").textContent = `${sys.cpu_percent}%`;
     $("#swapUsed").textContent = `${sys.swap_used_gb} GB`;
     $("#ollamaVer").textContent = sys.ollama_version || "—";
+    const lmstudioLoaded = sys.lmstudio_loaded;
+    const lmstudioModels = sys.lmstudio_models;
+    $("#lmstudioStatus").textContent =
+      lmstudioModels == null
+        ? "—"
+        : `${lmstudioLoaded || 0} loaded / ${lmstudioModels} models`;
 
     const loaded = running.models || [];
     const el = $("#runningModels");
     if (loaded.length) {
       el.innerHTML = loaded
-        .map((m) => `<span class="running-badge">${m.name}</span>`)
+        .map((m) => {
+          const provider = PROVIDER_LABELS[m.provider] || m.provider || "Ollama";
+          return `<span class="running-badge" title="${provider}">${m.name}</span>`;
+        })
         .join("");
     } else {
       el.innerHTML = '<span class="running-badge none">none</span>';
@@ -128,12 +167,12 @@ async function refreshSystem() {
 
 // ── Benchmark ──
 async function runBenchmark() {
-  const model = modelSelect.value;
-  if (!model) return;
+  const selected = selectedModel();
+  if (!selected) return;
 
   loadingOverlay.classList.add("active");
   loadingText.textContent = warmupCheck.checked
-    ? "Warming up model, then benchmarking…"
+    ? `Warming up ${PROVIDER_LABELS[selected.provider]} model, then benchmarking…`
     : "Running benchmark…";
   runBtn.disabled = true;
 
@@ -142,7 +181,8 @@ async function runBenchmark() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model,
+        model: selected.name,
+        provider: selected.provider,
         prompt: promptInput.value,
         num_predict: parseInt(numPredict.value, 10),
         temperature: parseFloat(tempVal.textContent),
@@ -192,10 +232,11 @@ function displayResults(r) {
     ["Overall throughput", `${fmt(tp.overall_tokens_per_sec)} tok/s`],
     ["Memory delta", r.memory_delta_gb != null ? `${r.memory_delta_gb > 0 ? "+" : ""}${r.memory_delta_gb} GB` : "—"],
     ["Done reason", r.done_reason || "—"],
-    ...(r.warmup ? [["Warm-up load", fmtS(r.warmup.load_duration_s)]] : []),
+    ...(r.warmup ? [["Warm-up", fmtS(r.warmup.load_duration_s ?? r.warmup.wall_clock_s)]] : []),
   ]);
 
   setTableRows("#modelTable", [
+    ["Provider", PROVIDER_LABELS[mi.provider] || mi.provider || "—"],
     ["Model name", mi.name || "—"],
     ["Parameter size", mi.parameter_size || "—"],
     ["Quantization", mi.quantization_level || "—"],
@@ -234,13 +275,15 @@ async function loadHistory() {
 }
 
 async function loadInsights() {
-  const model = modelSelect.value;
-  if (!model) {
+  const selected = selectedModel();
+  if (!selected) {
     renderInsights(null);
     return;
   }
   try {
-    const data = await api(`/api/insights?model=${encodeURIComponent(model)}`);
+    const data = await api(
+      `/api/insights?model=${encodeURIComponent(selected.name)}&provider=${encodeURIComponent(selected.provider)}`
+    );
     renderInsights(data.insights);
   } catch {
     renderInsights(null);
@@ -349,9 +392,9 @@ async function clearHistory() {
   await loadInsights();
 }
 
-function tpsRating(tps, history, model) {
+function tpsRating(tps, history, model, provider) {
   const pool = history
-    .filter((h) => h.model === model)
+    .filter((h) => h.model === model && (h.provider || "ollama") === provider)
     .map((h) => h.throughput?.eval_tokens_per_sec)
     .filter((v) => v != null);
   if (pool.length < 2 || tps == null) return "";
@@ -377,11 +420,12 @@ function renderHistoryTable(history) {
         ? new Date(h.timestamps.benchmark_at).toLocaleTimeString()
         : "—";
       const tps = h.throughput?.eval_tokens_per_sec;
-      const rating = tpsRating(tps, history, h.model);
+      const rating = tpsRating(tps, history, h.model, h.provider || "ollama");
       const opts = h.options || {};
+      const provider = PROVIDER_LABELS[h.provider] || h.provider || "Ollama";
       return `<tr>
         <td>${time}</td>
-        <td class="model-name">${h.model || "—"}</td>
+        <td class="model-name" title="${provider}">${h.model || "—"}</td>
         <td>${opts.temperature ?? "—"}</td>
         <td>${opts.num_predict?.toLocaleString() ?? "—"}</td>
         <td class="tps-cell ${rating}">${fmt(tps)}</td>
@@ -425,8 +469,9 @@ function initChart() {
 function updateChart(history) {
   if (!chart) return;
   const labels = history.map((h, i) => {
-    const short = (h.model || "?").split(":")[0];
-    return `${short} #${i + 1}`;
+    const provider = (PROVIDER_LABELS[h.provider] || h.provider || "Ollama").slice(0, 2);
+    const short = (h.model || "?").split(":")[0].split("/").pop();
+    return `${provider}:${short} #${i + 1}`;
   });
   chart.data.labels = labels;
   chart.data.datasets = [

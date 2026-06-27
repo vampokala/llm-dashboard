@@ -1,11 +1,11 @@
-"""LLM Benchmark Dashboard — FastAPI backend proxying Ollama."""
+"""LLM Benchmark Dashboard — FastAPI backend proxying Ollama and LM Studio."""
 
 from __future__ import annotations
 
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import psutil
@@ -15,7 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234")
 HISTORY_LIMIT = 50
+Provider = Literal["ollama", "lmstudio"]
 
 app = FastAPI(title="LLM Benchmark Dashboard", version="1.0.0")
 benchmark_history: list[dict[str, Any]] = []
@@ -26,6 +28,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 class BenchmarkRequest(BaseModel):
     model: str
+    provider: Provider = "ollama"
     prompt: str = "Write a short paragraph about local LLM inference."
     num_predict: int = Field(default=128, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
@@ -66,6 +69,179 @@ async def _ollama_post(path: str, payload: dict[str, Any], timeout: float = 600.
         return resp.json()
 
 
+async def _lmstudio_get(path: str) -> Any:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{LMSTUDIO_BASE_URL}{path}")
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _lmstudio_post(path: str, payload: dict[str, Any], timeout: float = 600.0) -> Any:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{LMSTUDIO_BASE_URL}{path}", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _fetch_all_models() -> tuple[list[dict[str, Any]], dict[str, str | None]]:
+    """Return normalized models and per-provider error messages."""
+    models: list[dict[str, Any]] = []
+    errors: dict[str, str | None] = {"ollama": None, "lmstudio": None}
+
+    try:
+        data = await _ollama_get("/api/tags")
+        models.extend(_normalize_ollama_model(m) for m in data.get("models", []))
+    except httpx.HTTPError as exc:
+        errors["ollama"] = str(exc)
+
+    try:
+        data = await _lmstudio_get("/api/v1/models")
+        for m in data.get("models", []):
+            if m.get("type") == "llm":
+                models.append(_normalize_lmstudio_model(m))
+    except httpx.HTTPError as exc:
+        errors["lmstudio"] = str(exc)
+
+    models.sort(key=lambda m: (m.get("provider", ""), m.get("display_name", "")))
+    return models, errors
+
+
+def _normalize_ollama_model(model: dict[str, Any]) -> dict[str, Any]:
+    details = model.get("details") or {}
+    return {
+        "name": model.get("name") or model.get("model"),
+        "provider": "ollama",
+        "display_name": model.get("name") or model.get("model"),
+        "size": model.get("size"),
+        "details": {
+            "parameter_size": details.get("parameter_size"),
+            "quantization_level": details.get("quantization_level"),
+            "family": details.get("family"),
+            "format": details.get("format"),
+            "context_length": details.get("context_length"),
+            "embedding_length": details.get("embedding_length"),
+        },
+        "digest": model.get("digest"),
+        "raw": model,
+    }
+
+
+def _normalize_lmstudio_model(model: dict[str, Any]) -> dict[str, Any]:
+    quant = model.get("quantization") or {}
+    return {
+        "name": model.get("key"),
+        "provider": "lmstudio",
+        "display_name": model.get("display_name") or model.get("key"),
+        "size": model.get("size_bytes"),
+        "details": {
+            "parameter_size": model.get("params_string"),
+            "quantization_level": quant.get("name"),
+            "family": model.get("architecture"),
+            "format": model.get("format"),
+            "context_length": model.get("max_context_length"),
+            "embedding_length": None,
+        },
+        "loaded": bool(model.get("loaded_instances")),
+        "raw": model,
+    }
+
+
+def _find_normalized_model(models: list[dict], name: str, provider: Provider) -> dict[str, Any] | None:
+    for m in models:
+        if m.get("name") == name and m.get("provider") == provider:
+            return m
+    return None
+
+
+def _build_lmstudio_metrics(
+    *,
+    model: str,
+    provider: Provider,
+    prompt: str,
+    response: str,
+    usage: dict[str, Any] | None,
+    wall_clock_s: float,
+    ttft_s: float | None,
+    warmup_metrics: dict[str, Any] | None,
+    model_info: dict[str, Any] | None,
+    system: dict[str, Any],
+    done_reason: str | None,
+) -> dict[str, Any]:
+    prompt_count = (usage or {}).get("prompt_tokens")
+    eval_count = (usage or {}).get("completion_tokens")
+    total_tokens = (prompt_count or 0) + (eval_count or 0)
+
+    if ttft_s is not None and eval_count and wall_clock_s > ttft_s:
+        prompt_eval_s = ttft_s
+        eval_s = round(wall_clock_s - ttft_s, 4)
+    elif total_tokens > 0:
+        prompt_eval_s = round(wall_clock_s * (prompt_count or 0) / total_tokens, 4)
+        eval_s = round(wall_clock_s * (eval_count or 0) / total_tokens, 4)
+    else:
+        prompt_eval_s = round(wall_clock_s, 4)
+        eval_s = 0.0
+
+    load_s = warmup_metrics.get("wall_clock_s") if warmup_metrics else None
+    details = (model_info or {}).get("details", {})
+    size_bytes = (model_info or {}).get("size")
+
+    return {
+        "model": model,
+        "provider": provider,
+        "prompt": prompt,
+        "response": response,
+        "done_reason": done_reason or "stop",
+        "timestamps": {
+            "created_at": None,
+            "benchmark_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "timing": {
+            "load_duration_s": load_s,
+            "prompt_eval_duration_s": prompt_eval_s,
+            "eval_duration_s": eval_s,
+            "total_duration_s": round(wall_clock_s, 4),
+            "time_to_first_token_s": (
+                round(load_s + prompt_eval_s, 4)
+                if load_s is not None and prompt_eval_s is not None
+                else ttft_s
+            ),
+        },
+        "tokens": {
+            "prompt_eval_count": prompt_count,
+            "eval_count": eval_count,
+            "total_tokens": total_tokens,
+        },
+        "throughput": {
+            "prompt_tokens_per_sec": (
+                round(prompt_count / prompt_eval_s, 2)
+                if prompt_count and prompt_eval_s
+                else None
+            ),
+            "eval_tokens_per_sec": (
+                round(eval_count / eval_s, 2) if eval_count and eval_s else None
+            ),
+            "overall_tokens_per_sec": (
+                round(total_tokens / wall_clock_s, 2) if total_tokens and wall_clock_s else None
+            ),
+        },
+        "model_info": {
+            "name": (model_info or {}).get("name"),
+            "provider": provider,
+            "size_bytes": size_bytes,
+            "size_human": _format_bytes(size_bytes) if size_bytes else None,
+            "parameter_size": details.get("parameter_size"),
+            "quantization_level": details.get("quantization_level"),
+            "family": details.get("family"),
+            "format": details.get("format"),
+            "context_length": details.get("context_length"),
+            "embedding_length": details.get("embedding_length"),
+            "digest": None,
+        },
+        "system": system,
+        "raw": {"usage": usage},
+    }
+
+
 def _system_snapshot() -> dict[str, Any]:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
@@ -78,13 +254,6 @@ def _system_snapshot() -> dict[str, Any]:
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "cpu_count": psutil.cpu_count(),
     }
-
-
-def _find_model_details(models: list[dict], name: str) -> dict[str, Any] | None:
-    for m in models:
-        if m.get("name") == name or m.get("model") == name:
-            return m
-    return None
 
 
 def _build_metrics(result: dict[str, Any], model_info: dict | None, system: dict) -> dict[str, Any]:
@@ -103,6 +272,7 @@ def _build_metrics(result: dict[str, Any], model_info: dict | None, system: dict
 
     return {
         "model": result.get("model"),
+        "provider": "ollama",
         "prompt": None,  # filled by caller
         "response": result.get("response", ""),
         "done_reason": result.get("done_reason"),
@@ -136,6 +306,7 @@ def _build_metrics(result: dict[str, Any], model_info: dict | None, system: dict
         },
         "model_info": {
             "name": (model_info or {}).get("name"),
+            "provider": "ollama",
             "size_bytes": size_bytes,
             "size_human": _format_bytes(size_bytes) if size_bytes else None,
             "parameter_size": details.get("parameter_size"),
@@ -158,30 +329,84 @@ async def index():
 
 @app.get("/api/health")
 async def health():
+    status: dict[str, Any] = {
+        "status": "offline",
+        "ollama": None,
+        "ollama_url": OLLAMA_BASE_URL,
+        "lmstudio": None,
+        "lmstudio_url": LMSTUDIO_BASE_URL,
+    }
+
     try:
         version = await _ollama_get("/api/version")
-        return {"status": "ok", "ollama": version, "ollama_url": OLLAMA_BASE_URL}
+        status["ollama"] = version
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail=f"Ollama unreachable: {exc}") from exc
+        status["ollama_error"] = str(exc)
+
+    try:
+        models = await _lmstudio_get("/api/v1/models")
+        status["lmstudio"] = {
+            "models": len([m for m in models.get("models", []) if m.get("type") == "llm"]),
+            "loaded": sum(
+                len(m.get("loaded_instances") or [])
+                for m in models.get("models", [])
+                if m.get("type") == "llm"
+            ),
+        }
+    except httpx.HTTPError as exc:
+        status["lmstudio_error"] = str(exc)
+
+    if status["ollama"] or status["lmstudio"]:
+        status["status"] = "ok"
+        return status
+
+    raise HTTPException(
+        status_code=503,
+        detail="No inference backends reachable (Ollama and LM Studio are offline)",
+    )
 
 
 @app.get("/api/models")
 async def list_models():
-    try:
-        data = await _ollama_get("/api/tags")
-        models = data.get("models", [])
-        models.sort(key=lambda m: m.get("name", ""))
-        return {"models": models}
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    models, errors = await _fetch_all_models()
+    if not models and errors["ollama"] and errors["lmstudio"]:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to list models. Ollama: {errors['ollama']}; LM Studio: {errors['lmstudio']}",
+        )
+    return {"models": models, "errors": {k: v for k, v in errors.items() if v}}
 
 
 @app.get("/api/running")
 async def running_models():
+    running: list[dict[str, Any]] = []
+
     try:
-        return await _ollama_get("/api/ps")
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        data = await _ollama_get("/api/ps")
+        for m in data.get("models", []):
+            running.append({
+                "name": m.get("name"),
+                "provider": "ollama",
+                "size": m.get("size"),
+            })
+    except httpx.HTTPError:
+        pass
+
+    try:
+        data = await _lmstudio_get("/api/v1/models")
+        for m in data.get("models", []):
+            if m.get("type") != "llm":
+                continue
+            for inst in m.get("loaded_instances") or []:
+                running.append({
+                    "name": m.get("display_name") or m.get("key"),
+                    "provider": "lmstudio",
+                    "model_id": inst.get("id") or m.get("key"),
+                })
+    except httpx.HTTPError:
+        pass
+
+    return {"models": running}
 
 
 @app.get("/api/system")
@@ -192,6 +417,16 @@ async def system_stats():
         snapshot["ollama_version"] = version.get("version")
     except httpx.HTTPError:
         snapshot["ollama_version"] = None
+
+    try:
+        data = await _lmstudio_get("/api/v1/models")
+        llm_models = [m for m in data.get("models", []) if m.get("type") == "llm"]
+        snapshot["lmstudio_models"] = len(llm_models)
+        snapshot["lmstudio_loaded"] = sum(len(m.get("loaded_instances") or []) for m in llm_models)
+    except httpx.HTTPError:
+        snapshot["lmstudio_models"] = None
+        snapshot["lmstudio_loaded"] = None
+
     return snapshot
 
 
@@ -355,15 +590,22 @@ def _analyze_model_insights(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 @app.get("/api/insights")
-async def get_insights(model: str | None = None):
+async def get_insights(model: str | None = None, provider: Provider | None = None):
+    def _matches(entry: dict[str, Any]) -> bool:
+        if model and entry.get("model") != model:
+            return False
+        if provider and entry.get("provider") != provider:
+            return False
+        return True
+
     if model:
-        entries = [h for h in benchmark_history if h.get("model") == model]
-        return {"model": model, "insights": _analyze_model_insights(entries)}
+        entries = [h for h in benchmark_history if _matches(h)]
+        return {"model": model, "provider": provider, "insights": _analyze_model_insights(entries)}
 
     by_model: dict[str, list[dict[str, Any]]] = {}
     for h in benchmark_history:
-        name = h.get("model") or "unknown"
-        by_model.setdefault(name, []).append(h)
+        key = f"{h.get('provider', 'ollama')}:{h.get('model') or 'unknown'}"
+        by_model.setdefault(key, []).append(h)
 
     return {
         "models": {
@@ -382,46 +624,91 @@ async def get_history():
 async def run_benchmark(req: BenchmarkRequest):
     system_before = _system_snapshot()
 
-    try:
-        tags = await _ollama_get("/api/tags")
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to list models: {exc}") from exc
-
-    model_info = _find_model_details(tags.get("models", []), req.model)
+    all_models, _errors = await _fetch_all_models()
+    model_info = _find_normalized_model(all_models, req.model, req.provider)
     if model_info is None:
-        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not found")
-
-    payload = {
-        "model": req.model,
-        "prompt": req.prompt,
-        "stream": False,
-        "options": {
-            "num_predict": req.num_predict,
-            "temperature": req.temperature,
-        },
-    }
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{req.model}' not found for provider '{req.provider}'",
+        )
 
     warmup_metrics = None
+    wall_clock_s = 0.0
+
     try:
-        if req.warmup:
-            warmup_payload = {**payload, "options": {**payload["options"], "num_predict": 5}}
-            warmup_result = await _ollama_post("/api/generate", warmup_payload, timeout=300.0)
-            warmup_metrics = {
-                "load_duration_s": _ns_to_seconds(warmup_result.get("load_duration")),
-                "eval_tokens_per_sec": _tokens_per_second(
-                    warmup_result.get("eval_count"),
-                    warmup_result.get("eval_duration"),
-                ),
+        if req.provider == "ollama":
+            payload = {
+                "model": req.model,
+                "prompt": req.prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": req.num_predict,
+                    "temperature": req.temperature,
+                },
             }
 
-        started = time.perf_counter()
-        result = await _ollama_post("/api/generate", payload, timeout=600.0)
-        wall_clock_s = round(time.perf_counter() - started, 4)
+            if req.warmup:
+                warmup_payload = {**payload, "options": {**payload["options"], "num_predict": 5}}
+                warmup_result = await _ollama_post("/api/generate", warmup_payload, timeout=300.0)
+                warmup_metrics = {
+                    "load_duration_s": _ns_to_seconds(warmup_result.get("load_duration")),
+                    "eval_tokens_per_sec": _tokens_per_second(
+                        warmup_result.get("eval_count"),
+                        warmup_result.get("eval_duration"),
+                    ),
+                }
+
+            started = time.perf_counter()
+            result = await _ollama_post("/api/generate", payload, timeout=600.0)
+            wall_clock_s = round(time.perf_counter() - started, 4)
+
+            system_after = _system_snapshot()
+            metrics = _build_metrics(result, model_info, system_after)
+            response_text = result.get("response", "")
+            done_reason = result.get("done_reason")
+        else:
+            payload = {
+                "model": req.model,
+                "prompt": req.prompt,
+                "max_tokens": req.num_predict,
+                "temperature": req.temperature,
+                "stream": False,
+            }
+
+            if req.warmup:
+                warmup_payload = {**payload, "max_tokens": 5}
+                warmup_started = time.perf_counter()
+                await _lmstudio_post("/v1/completions", warmup_payload, timeout=300.0)
+                warmup_metrics = {
+                    "wall_clock_s": round(time.perf_counter() - warmup_started, 4),
+                }
+
+            started = time.perf_counter()
+            result = await _lmstudio_post("/v1/completions", payload, timeout=600.0)
+            wall_clock_s = round(time.perf_counter() - started, 4)
+
+            choice = (result.get("choices") or [{}])[0]
+            response_text = choice.get("text") or ""
+            done_reason = choice.get("finish_reason")
+            usage = result.get("usage")
+
+            system_after = _system_snapshot()
+            metrics = _build_lmstudio_metrics(
+                model=req.model,
+                provider=req.provider,
+                prompt=req.prompt,
+                response=response_text,
+                usage=usage,
+                wall_clock_s=wall_clock_s,
+                ttft_s=None,
+                warmup_metrics=warmup_metrics,
+                model_info=model_info,
+                system=system_after,
+                done_reason=done_reason,
+            )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Benchmark failed: {exc}") from exc
 
-    system_after = _system_snapshot()
-    metrics = _build_metrics(result, model_info, system_after)
     metrics["prompt"] = req.prompt
     metrics["options"] = {"num_predict": req.num_predict, "temperature": req.temperature}
     metrics["warmup"] = warmup_metrics
@@ -435,7 +722,10 @@ async def run_benchmark(req: BenchmarkRequest):
     if len(benchmark_history) > HISTORY_LIMIT:
         benchmark_history.pop(0)
 
-    model_entries = [h for h in benchmark_history if h.get("model") == req.model]
+    model_entries = [
+        h for h in benchmark_history
+        if h.get("model") == req.model and h.get("provider") == req.provider
+    ]
     metrics["insights"] = _analyze_model_insights(model_entries)
 
     return metrics
