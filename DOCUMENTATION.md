@@ -1,6 +1,6 @@
 # LLM Benchmark Dashboard — Technical Documentation
 
-A web-based benchmarking tool for measuring **local LLM inference performance** through [Ollama](https://ollama.com). The dashboard runs controlled generation requests, collects timing and throughput metrics from Ollama's API, tracks benchmark history, and provides comparative insights across parameter settings.
+A web-based benchmarking tool for measuring **local LLM inference performance** through [Ollama](https://ollama.com) and [LM Studio](https://lmstudio.ai). The dashboard runs controlled generation requests against either backend, collects timing and throughput metrics, tracks benchmark history, and provides comparative insights across parameter settings. Models from both providers appear in a unified selector; benchmarks and insights are scoped per **provider + model** pair.
 
 ---
 
@@ -33,31 +33,33 @@ A web-based benchmarking tool for measuring **local LLM inference performance** 
 
 | Capability | Description |
 |------------|-------------|
-| **Model discovery** | Lists all models installed in Ollama with metadata (size, quantization, family) |
+| **Dual-backend support** | Benchmarks models from Ollama and LM Studio; either or both backends can be online |
+| **Model discovery** | Lists LLM models from both providers with metadata (size, quantization, family, context length) |
 | **Controlled benchmarks** | Runs reproducible generation requests with configurable prompts and inference parameters |
 | **Performance metrics** | Measures load time, prompt processing speed, generation throughput, time-to-first-token, and more |
-| **System monitoring** | Displays host CPU, memory, swap, and currently loaded Ollama models |
+| **System monitoring** | Displays host CPU, memory, swap, Ollama version, LM Studio load status, and loaded models |
 | **Historical comparison** | Stores up to 50 benchmark runs in memory with charts and tabular history |
-| **Parameter insights** | Compares temperature and max-token settings to recommend best-performing configurations |
+| **Parameter insights** | Compares temperature and max-token settings per provider+model to recommend best configurations |
 
 ### What This Project Does *Not* Do
 
 - **Quality evaluation** — It does not score answer correctness, reasoning quality, or alignment with human preferences.
 - **Multi-model parallel benchmarking** — Benchmarks run one model at a time per request.
 - **Persistent storage** — History is in-memory only; restarting the server clears all runs.
-- **GPU-specific metrics** — No direct NVML/CUDA telemetry; relies on Ollama timings and host-level `psutil` stats.
+- **GPU-specific metrics** — No direct NVML/CUDA telemetry; relies on backend-reported timings (Ollama) or derived wall-clock metrics (LM Studio) plus host-level `psutil` stats.
+- **Cross-backend comparison** — Ollama and LM Studio use different runtimes and metric sources; compare runs within the same provider, not across providers.
 
 ### Target Users
 
-- Developers evaluating local LLM deployments
+- Developers evaluating local LLM deployments (Ollama, LM Studio, or both)
 - Hardware testers comparing quantization levels or model sizes
-- Anyone tuning Ollama inference parameters for throughput vs. latency trade-offs
+- Anyone tuning inference parameters for throughput vs. latency trade-offs on a given backend
 
 ---
 
 ## 2. Architecture
 
-The application follows a **three-tier proxy architecture**: a static web frontend talks to a FastAPI backend, which proxies requests to the Ollama HTTP API.
+The application follows a **three-tier proxy architecture**: a static web frontend talks to a FastAPI backend, which proxies requests to one or more inference backends (Ollama HTTP API and/or LM Studio OpenAI-compatible API).
 
 ### Diagram Color Theme
 
@@ -93,8 +95,14 @@ flowchart TB
 
     subgraph Ollama["Ollama Runtime"]
         OllamaAPI["HTTP API port 11434"]
-        Models["Local GGUF Models"]
-        Inference["Inference Engine"]
+        OllamaModels["Local GGUF Models"]
+        OllamaInference["Inference Engine"]
+    end
+
+    subgraph LMStudio["LM Studio Runtime"]
+        LMSAPI["OpenAI-compatible API port 1234"]
+        LMSModels["Local Models"]
+        LMSInference["Inference Engine"]
     end
 
     HTML --> JS
@@ -104,19 +112,24 @@ flowchart TB
     FastAPI --> Insights
     FastAPI --> Psutil
     FastAPI -->|"httpx async"| OllamaAPI
-    OllamaAPI --> Inference
-    Inference --> Models
+    FastAPI -->|"httpx async"| LMSAPI
+    OllamaAPI --> OllamaInference
+    OllamaInference --> OllamaModels
+    LMSAPI --> LMSInference
+    LMSInference --> LMSModels
 
     classDef info fill:#121820,stroke:#4da3ff,color:#4da3ff
     classDef accent fill:#1a2230,stroke:#76b900,color:#76b900
     classDef surface fill:#121820,stroke:#2a3544,color:#e8edf4
     classDef muted fill:#0b0f14,stroke:#2a3544,color:#8b9cb3
+    classDef warn fill:#1a2230,stroke:#f0a020,color:#f0a020
 
     class HTML,JS,CSS,ChartJS info
     class FastAPI,Insights,Psutil accent
-    class Static,Inference surface
+    class Static,OllamaInference,LMSInference surface
     class History muted
-    class OllamaAPI,Models surface
+    class OllamaAPI,OllamaModels surface
+    class LMSAPI,LMSModels warn
 ```
 
 ### Technology Stack
@@ -128,7 +141,7 @@ flowchart TB
 | System metrics | psutil | CPU, RAM, swap snapshots |
 | Frontend | Vanilla JavaScript | No build step required |
 | Charts | Chart.js 4.4.7 | Loaded from jsDelivr CDN |
-| LLM runtime | Ollama | Must be running separately |
+| LLM runtimes | Ollama, LM Studio | At least one must be running; both optional |
 
 ### Component Responsibilities
 
@@ -148,6 +161,7 @@ flowchart LR
         G["Metric Builder"]
         H["Rating Engine"]
         I["Ollama Proxy"]
+        J["LM Studio Proxy"]
     end
 
     A -->|"GET /api/health"| F
@@ -156,15 +170,18 @@ flowchart LR
     D -->|"GET /api/history"| F
     E -->|"GET /api/insights"| H
     F --> I
+    F --> J
     G --> H
 
     classDef info fill:#121820,stroke:#4da3ff,color:#4da3ff
     classDef accent fill:#1a2230,stroke:#76b900,color:#76b900
     classDef surface fill:#121820,stroke:#2a3544,color:#e8edf4
+    classDef warn fill:#1a2230,stroke:#f0a020,color:#f0a020
 
     class A,B,C,D,E info
     class F,I surface
     class G,H accent
+    class J warn
 ```
 
 ---
@@ -176,7 +193,9 @@ flowchart LR
 | Requirement | Minimum |
 |-------------|---------|
 | Python | 3.10+ (uses `list[dict]` type hints) |
-| Ollama | Installed and running with at least one model pulled |
+| Inference backend | Ollama **or** LM Studio (or both) with at least one LLM model available |
+| Ollama | Installed and running on port 11434 (if used) |
+| LM Studio | Installed with local server enabled on port 1234 (if used) |
 | OS | Linux, macOS, or Windows (tested on Linux) |
 | Browser | Modern browser with ES6+ support |
 
@@ -184,9 +203,10 @@ flowchart LR
 
 Performance numbers are **hardware-dependent**. Meaningful benchmarks require:
 
-- Sufficient RAM for the model (check Ollama model size vs. available memory)
-- GPU acceleration if configured in Ollama (dashboard reports throughput regardless of CPU/GPU backend)
+- Sufficient RAM for the model (check model size vs. available memory)
+- GPU acceleration if configured in the backend (dashboard reports throughput regardless of CPU/GPU)
 - Minimal competing load during benchmarks for consistent results
+- For LM Studio: load the target model in the LM Studio UI before benchmarking (or rely on warm-up to trigger first load)
 
 ---
 
@@ -195,16 +215,22 @@ Performance numbers are **hardware-dependent**. Meaningful benchmarks require:
 ### Quick Start
 
 ```bash
-# 1. Ensure Ollama is running
+# 1. Start at least one inference backend
+
+# Option A — Ollama
 ollama serve          # if not already running as a service
 ollama pull llama3.2  # example: pull a model
+
+# Option B — LM Studio
+# Install from https://lmstudio.ai, enable the local server (Developer tab),
+# and download/load at least one LLM model.
 
 # 2. Start the dashboard
 cd LLM-Dashboard
 ./start.sh
 ```
 
-The dashboard will be available at **http://localhost:8765** (default).
+The dashboard will be available at **http://localhost:8765** (default). The header shows which backends are connected (e.g. "Ollama + LM Studio connected").
 
 ### What `start.sh` Does
 
@@ -238,7 +264,8 @@ flowchart TD
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export OLLAMA_BASE_URL=http://127.0.0.1:11434  # optional
+export OLLAMA_BASE_URL=http://127.0.0.1:11434    # optional
+export LMSTUDIO_BASE_URL=http://127.0.0.1:1234   # optional
 uvicorn server:app --host 0.0.0.0 --port 8765 --reload
 ```
 
@@ -248,7 +275,7 @@ uvicorn server:app --host 0.0.0.0 --port 8765 --reload
 |---------|---------|
 | `fastapi` | Web framework and request validation |
 | `uvicorn[standard]` | ASGI server |
-| `httpx` | Async HTTP client for Ollama API |
+| `httpx` | Async HTTP client for Ollama and LM Studio APIs |
 | `psutil` | Host system metrics |
 
 ---
@@ -260,6 +287,7 @@ uvicorn server:app --host 0.0.0.0 --port 8765 --reload
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Base URL for Ollama HTTP API |
+| `LMSTUDIO_BASE_URL` | `http://127.0.0.1:1234` | Base URL for LM Studio local server |
 | `PORT` | `8765` | Dashboard listen port (via `start.sh` only) |
 
 ### Server Constants (in `server.py`)
@@ -269,7 +297,7 @@ uvicorn server:app --host 0.0.0.0 --port 8765 --reload
 | `HISTORY_LIMIT` | `50` | Maximum benchmark runs stored in memory |
 | Benchmark timeout | `600s` | Max wait for main generation request |
 | Warmup timeout | `300s` | Max wait for warmup generation |
-| Health/models timeout | `30s` | Timeout for lightweight Ollama GET requests |
+| Health/models timeout | `30s` | Timeout for lightweight backend GET requests |
 
 ---
 
@@ -303,16 +331,20 @@ flowchart TD
     Validate -->|No| End1(["Abort"])
     Validate -->|Yes| ShowLoading["Show loading overlay"]
     ShowLoading --> SnapshotBefore["Capture system snapshot"]
-    SnapshotBefore --> ListModels["GET Ollama /api/tags"]
-    ListModels --> ModelFound{"Model exists?"}
+    SnapshotBefore --> ListModels["Fetch models from both backends"]
+    ListModels --> ModelFound{"Model exists for provider?"}
     ModelFound -->|No| Error404["HTTP 404"]
     ModelFound -->|Yes| Warmup{"Warmup enabled?"}
 
-    Warmup -->|Yes| WarmupRun["POST /api/generate<br/>num_predict equals 5"]
-    WarmupRun --> MainRun["POST /api/generate<br/>full benchmark"]
+    Warmup -->|Yes| WarmupRun["Warm-up request<br/>5 tokens"]
+    WarmupRun --> MainRun["Main benchmark request"]
     Warmup -->|No| MainRun
 
-    MainRun --> BuildMetrics["Build metrics from Ollama response"]
+    MainRun --> ProviderCheck{"Provider?"}
+    ProviderCheck -->|ollama| OllamaRun["POST /api/generate"]
+    ProviderCheck -->|lmstudio| LMSRun["POST /v1/completions"]
+    OllamaRun --> BuildMetrics["Build metrics from response"]
+    LMSRun --> BuildMetrics
     BuildMetrics --> SnapshotAfter["Capture system snapshot after"]
     SnapshotAfter --> CalcDelta["Compute memory delta"]
     CalcDelta --> AppendHistory["Append to history buffer"]
@@ -348,27 +380,36 @@ sequenceDiagram
     participant UI as app.js
     participant API as FastAPI
     participant PS as psutil
-    participant Ollama as Ollama API
+    participant Backend as Ollama or LM Studio
 
     User->>UI: Click Run Benchmark
     UI->>UI: Show loading overlay
-    UI->>API: POST /api/benchmark
+    UI->>API: POST /api/benchmark (model, provider, ...)
 
     API->>PS: system snapshot before
-    API->>Ollama: GET /api/tags
-    Ollama-->>API: models list and metadata
+    API->>API: validate model for provider
 
     alt warmup enabled
-        API->>Ollama: POST /api/generate num_predict 5
-        Ollama-->>API: warmup result
+        alt provider ollama
+            API->>Backend: POST /api/generate num_predict 5
+        else provider lmstudio
+            API->>Backend: POST /v1/completions max_tokens 5
+        end
+        Backend-->>API: warmup result
     end
 
-    API->>Ollama: POST /api/generate full request
-    Note over Ollama: Load model, prompt eval, generation
-    Ollama-->>API: timing fields in nanoseconds
+    alt provider ollama
+        API->>Backend: POST /api/generate full request
+        Note over Backend: Load model, prompt eval, generation
+        Backend-->>API: nanosecond timing fields
+    else provider lmstudio
+        API->>Backend: POST /v1/completions full request
+        Note over Backend: Load model, prompt eval, generation
+        Backend-->>API: usage tokens + completion text
+    end
 
     API->>PS: system snapshot after
-    API->>API: build metrics
+    API->>API: build metrics (provider-specific)
     API->>API: append to history
     API->>API: analyze insights
     API-->>UI: metrics and insights JSON
@@ -388,23 +429,30 @@ sequenceDiagram
     participant Browser
     participant API as FastAPI
     participant Ollama
+    participant LMS as LM Studio
 
     Browser->>API: GET /
     API-->>Browser: index.html
 
     Browser->>API: GET static assets
     Browser->>API: GET /api/health
-    API->>Ollama: GET /api/version
-    Ollama-->>API: version info
+    par Check backends
+        API->>Ollama: GET /api/version
+        Ollama-->>API: version info
+    and
+        API->>LMS: GET /api/v1/models
+        LMS-->>API: model count and loaded instances
+    end
     API-->>Browser: health status ok
 
     par Parallel refresh
         Browser->>API: GET /api/models
         API->>Ollama: GET /api/tags
-        Ollama-->>Browser: models list
+        API->>LMS: GET /api/v1/models
+        API-->>Browser: merged models list
     and
         Browser->>API: GET /api/system
-        API-->>Browser: CPU and RAM stats
+        API-->>Browser: CPU, RAM, Ollama version, LM Studio stats
     and
         Browser->>API: GET /api/history
         API-->>Browser: benchmark history
@@ -416,9 +464,36 @@ sequenceDiagram
     loop Every 5 seconds
         Browser->>API: GET /api/system and /api/running
         API->>Ollama: GET /api/ps
+        API->>LMS: GET /api/v1/models
         API-->>Browser: system and loaded models
     end
 ```
+
+### LM Studio Benchmark Path
+
+When `provider` is `"lmstudio"`, the backend uses LM Studio's **OpenAI-compatible completions API**:
+
+| Step | Action |
+|------|--------|
+| 1. Model validation | `GET /api/v1/models` — match `model` key against LLM-type entries |
+| 2. Warm-up (optional) | `POST /v1/completions` with `max_tokens: 5`; wall-clock recorded as load time |
+| 3. Main run | `POST /v1/completions` with full `max_tokens` and `temperature` |
+| 4. Metric build | `_build_lmstudio_metrics()` derives timing from wall-clock + `usage` token counts |
+| 5. History | Stored with `provider: "lmstudio"`; insights scoped to that provider+model |
+
+**Requirements:**
+- LM Studio local server running (default `http://127.0.0.1:1234`)
+- Target model downloaded in LM Studio
+- Model loaded in memory (recommended) or rely on warm-up to trigger load
+
+**API endpoints used:**
+
+| Purpose | Endpoint |
+|---------|----------|
+| Health / model count | `GET /api/v1/models` |
+| List models | `GET /api/v1/models` (filter `type == "llm"`) |
+| Loaded instances | `GET /api/v1/models` → `loaded_instances` |
+| Benchmark | `POST /v1/completions` |
 
 ---
 
@@ -465,33 +540,47 @@ mindmap
 
 #### 1. Controlled Generation Benchmark
 
-Each run sends a **single non-streaming** `POST /api/generate` request to Ollama with:
+Each run sends a **single non-streaming** generation request to the selected backend:
+
+| Provider | Endpoint | Key parameters |
+|----------|----------|----------------|
+| **Ollama** | `POST /api/generate` | `num_predict`, `temperature` in `options` |
+| **LM Studio** | `POST /v1/completions` | `max_tokens`, `temperature` (OpenAI-compatible) |
+
+Both paths use:
 
 - A user-defined or preset prompt (controls prompt token count and task type)
-- Fixed `num_predict` (maximum tokens to generate)
+- Fixed max output tokens (`num_predict` / `max_tokens`)
 - Fixed `temperature` (sampling randomness)
 
-Ollama returns nanosecond-precision timing fields that the dashboard converts to seconds and derives throughput from.
+**Ollama** returns nanosecond-precision timing fields that the dashboard converts to seconds and derives throughput from.
+
+**LM Studio** returns token usage (`prompt_tokens`, `completion_tokens`) and completion text. The dashboard measures **wall-clock time** around the HTTP call and derives prompt/generation durations proportionally from token counts (see [Metrics Reference](#10-metrics-reference)).
 
 #### 2. Warmup Protocol (Recommended)
 
 When **warm-up** is enabled (default):
 
-1. A short generation runs first with `num_predict = 5` to load the model into memory.
+1. A short generation runs first with **5 output tokens** to load the model into memory.
 2. The main benchmark run follows immediately.
 
-**Purpose:** The first request to a cold model includes **model load time** (`load_duration`). Warmup separates cold-start loading from the measured benchmark, giving more consistent throughput readings for the primary run.
+| Provider | Warm-up request |
+|----------|-----------------|
+| Ollama | `POST /api/generate` with `num_predict: 5` |
+| LM Studio | `POST /v1/completions` with `max_tokens: 5` |
 
-**Trade-off:** Total wall-clock time increases; load time on the main run may still be non-zero if Ollama unloads the model between requests.
+**Purpose:** The first request to a cold model includes **model load time**. Warmup separates cold-start loading from the measured benchmark, giving more consistent throughput readings for the primary run.
+
+**Trade-off:** Total wall-clock time increases. On Ollama, load time on the main run may still be non-zero if the model unloads between requests. On LM Studio, warmup wall-clock time is recorded as `load_duration_s`.
 
 #### 3. Relative Rating (Not Absolute)
 
-The dashboard does **not** define fixed thresholds like "50 tok/s = good." Instead, it uses **percentile ranking within your own benchmark history** for a given model:
+The dashboard does **not** define fixed thresholds like "50 tok/s = good." Instead, it uses **percentile ranking within your own benchmark history** for a given **provider + model** pair:
 
-- Compare each metric against all prior runs for that model
+- Compare each metric against all prior runs for that model on the same provider
 - Classify as **Best**, **Expected**, or **Poor**
 
-This makes the tool useful for **A/B testing parameters** on your hardware, not for publishing absolute leaderboard scores.
+This makes the tool useful for **A/B testing parameters** on your hardware. Do not compare absolute tok/s values across Ollama vs. LM Studio — they use different runtimes and metric derivation.
 
 #### 4. Prompt Diversity (Qualitative Stress Testing)
 
@@ -527,11 +616,14 @@ This dashboard provides the **performance layer** that complements quality bench
 
 | Parameter | UI Control | API Field | Default | Range | Effect |
 |-----------|------------|-----------|---------|-------|--------|
-| **Model** | Dropdown | `model` | (first available) | Installed Ollama models | Determines architecture, size, quantization |
+| **Model** | Dropdown | `model` | (first available) | Models from Ollama and LM Studio | Model architecture, size, quantization |
+| **Provider** | (from model selection) | `provider` | `"ollama"` | `"ollama"` \| `"lmstudio"` | Routes benchmark to the correct backend |
 | **Prompt** | Textarea | `prompt` | See `index.html` | Free text | Affects prompt token count and generation behavior |
-| **Max Tokens** | Number input | `num_predict` | `128` | `1` – `4096` | Upper bound on generated tokens; actual count may be lower if model stops early |
+| **Max Tokens** | Number input | `num_predict` | `128` | `1` – `4096` | Upper bound on generated tokens (`max_tokens` for LM Studio) |
 | **Temperature** | Slider (0.0–2.0) | `temperature` | `0.7` | `0.0` – `2.0` | Controls randomness; **should not affect throughput significantly** on most backends, but is tracked for experiment reproducibility |
 | **Warm-up** | Checkbox | `warmup` | `true` | boolean | Pre-loads model with a 5-token generation |
+
+Models in the dropdown are prefixed with `[Ollama]` or `[LM Studio]`. The frontend sends both `model` and `provider` with each benchmark request.
 
 ### Ollama Options Payload
 
@@ -549,35 +641,77 @@ The backend sends this structure to Ollama:
 }
 ```
 
+### LM Studio Completions Payload
+
+The backend sends this OpenAI-compatible structure to LM Studio:
+
+```json
+{
+  "model": "qwen/qwen3.6-35b-a3b",
+  "prompt": "Your benchmark prompt here",
+  "max_tokens": 128,
+  "temperature": 0.7,
+  "stream": false
+}
+```
+
+LM Studio model keys come from `GET /api/v1/models` (LLM-type models only).
+
 ### Parameters Not Exposed (Future Extensions)
 
-Ollama supports additional options not currently in the UI:
+Ollama and LM Studio support additional options not currently in the UI:
 
-| Ollama Option | Description |
-|---------------|-------------|
-| `top_p` | Nucleus sampling |
-| `top_k` | Top-k sampling |
-| `repeat_penalty` | Repetition suppression |
-| `num_ctx` | Context window size |
-| `num_gpu` | GPU layer offloading |
-| `seed` | Deterministic sampling |
+| Option | Ollama | LM Studio |
+|--------|--------|-----------|
+| `top_p` | Nucleus sampling | Supported |
+| `top_k` | Top-k sampling | Supported |
+| `repeat_penalty` | Repetition suppression | — |
+| `num_ctx` | Context window size | Via model load settings |
+| `num_gpu` | GPU layer offloading | Via LM Studio load settings |
+| `seed` | Deterministic sampling | Supported |
 
 ---
 
 ## 10. Metrics Reference
 
+Metrics are built differently depending on the provider. Both paths produce the same **response schema** so the UI, history, and insights engine work uniformly.
+
+### Provider Comparison
+
+| Aspect | Ollama | LM Studio |
+|--------|--------|-----------|
+| Timing source | Nanosecond fields in API response | Wall-clock around HTTP call + proportional split |
+| Token counts | `prompt_eval_count`, `eval_count` | `usage.prompt_tokens`, `usage.completion_tokens` |
+| Load time | `load_duration` from API (warmup also reports load) | Warmup wall-clock stored as `load_duration_s` |
+| TTFT | `load_duration_s + prompt_eval_duration_s` | Same formula using derived durations |
+| Response text | `response` field | `choices[0].text` |
+| Done reason | `done_reason` | `choices[0].finish_reason` |
+
 ### Timing Metrics
 
-All Ollama durations are reported in **nanoseconds** internally and converted to **seconds** (4 decimal places) by the dashboard.
+**Ollama:** All durations are reported in **nanoseconds** internally and converted to **seconds** (4 decimal places).
 
 | Metric | Ollama Source Field | Formula / Notes |
 |--------|---------------------|-----------------|
 | **Load duration** | `load_duration` | Time to load model weights into memory |
-| **Prompt eval duration** | `prompt_eval_duration` | Time to process (embed + forward) the input prompt |
+| **Prompt eval duration** | `prompt_eval_duration` | Time to process the input prompt |
 | **Generation duration** | `eval_duration` | Time spent generating output tokens |
-| **Total duration** | `total_duration` | End-to-end Ollama-reported time for the request |
+| **Total duration** | `total_duration` | End-to-end Ollama-reported time |
 | **Time to first token (TTFT)** | Derived | `load_duration_s + prompt_eval_duration_s` |
 | **Wall clock** | Derived | Python `time.perf_counter()` around the main HTTP call |
+
+**LM Studio:** Durations are **derived** from wall-clock time and token usage:
+
+| Metric | Derivation |
+|--------|------------|
+| **Wall clock** | `time.perf_counter()` around `POST /v1/completions` |
+| **Prompt eval duration** | Proportional share of wall-clock by `prompt_tokens / total_tokens` |
+| **Generation duration** | Remaining wall-clock after prompt phase |
+| **Load duration** | Warmup wall-clock (if warmup enabled) |
+| **Total duration** | Same as wall-clock for the main request |
+| **TTFT** | `load_duration_s + prompt_eval_duration_s` (when load known) |
+
+> LM Studio does not expose separate nanosecond timing phases like Ollama. Proportional splitting is an approximation when prompt and generation token counts differ significantly.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"sectionBkgColor": "#121820", "altSectionBkgColor": "#1a2230", "sectionBkgColor2": "#0b0f14", "taskBkgColor": "#76b900", "taskTextColor": "#0b0f14", "activeTaskBkgColor": "#4da3ff", "gridColor": "#2a3544", "todayLineColor": "#e05252"}}}%%
@@ -600,20 +734,20 @@ gantt
 
 | Metric | Formula | Unit |
 |--------|---------|------|
-| **Prompt tokens/sec** | `prompt_eval_count / prompt_eval_duration` | tok/s |
-| **Generation tokens/sec** | `eval_count / eval_duration` | tok/s |
-| **Overall tokens/sec** | `(prompt_eval_count + eval_count) / total_duration` | tok/s |
+| **Prompt tokens/sec** | `prompt_tokens / prompt_eval_duration_s` | tok/s |
+| **Generation tokens/sec** | `completion_tokens / eval_duration_s` | tok/s |
+| **Overall tokens/sec** | `total_tokens / total_duration_s` | tok/s |
 
 > **Primary KPI:** `eval_tokens_per_sec` (generation speed) is the headline metric used for insights, charting, and best-run selection.
 
 ### Token Metrics
 
-| Metric | Source | Description |
-|--------|--------|-------------|
-| `prompt_eval_count` | Ollama | Tokens in the prompt |
-| `eval_count` | Ollama | Tokens actually generated |
-| `total_tokens` | Derived | Sum of prompt + generated |
-| `done_reason` | Ollama | Why generation stopped (`stop`, `length`, etc.) |
+| Metric | Ollama Source | LM Studio Source |
+|--------|---------------|------------------|
+| Prompt tokens | `prompt_eval_count` | `usage.prompt_tokens` |
+| Generated tokens | `eval_count` | `usage.completion_tokens` |
+| Total tokens | Derived sum | Derived sum |
+| Done reason | `done_reason` | `choices[0].finish_reason` |
 
 ### System Metrics
 
@@ -632,18 +766,21 @@ Captured via `psutil` before and after each benchmark:
 
 ### Model Metadata
 
-Pulled from Ollama `/api/tags` for the selected model:
+Normalized from each backend's model list endpoint:
 
-| Field | Description |
-|-------|-------------|
-| `parameter_size` | e.g., `7B`, `13B` |
-| `quantization_level` | e.g., `Q4_K_M`, `Q8_0` |
-| `family` | Model family (llama, gemma, etc.) |
-| `format` | File format (usually `gguf`) |
-| `context_length` | Maximum context window |
-| `embedding_length` | Embedding dimension |
-| `size_bytes` / `size_human` | On-disk model size |
-| `digest` | Model content hash |
+| Field | Ollama source | LM Studio source |
+|-------|---------------|------------------|
+| `name` | Model tag name | Model `key` |
+| `provider` | `"ollama"` | `"lmstudio"` |
+| `display_name` | Model name | `display_name` |
+| `parameter_size` | `details.parameter_size` | `params_string` |
+| `quantization_level` | `details.quantization_level` | `quantization.name` |
+| `family` | `details.family` | `architecture` |
+| `format` | `details.format` | `format` |
+| `context_length` | `details.context_length` | `max_context_length` |
+| `size_bytes` | `size` | `size_bytes` |
+| `digest` | Model digest | `null` (not available) |
+| `loaded` | Via `/api/ps` | `loaded_instances` non-empty |
 
 ---
 
@@ -651,7 +788,7 @@ Pulled from Ollama `/api/tags` for the selected model:
 
 ### Rating Categories
 
-The dashboard assigns one of three ratings by comparing a value against **all benchmark runs for the same model**:
+The dashboard assigns one of three ratings by comparing a value against **all benchmark runs for the same provider + model**:
 
 | Rating | Color (UI) | Meaning |
 |--------|------------|---------|
@@ -823,24 +960,28 @@ Serves the dashboard HTML.
 
 ### `GET /api/health`
 
-Checks Ollama connectivity.
+Checks connectivity to Ollama and LM Studio. Returns **200** if at least one backend is reachable; **503** if both are offline.
 
-**Response (200):**
+**Response (200, both online):**
 ```json
 {
   "status": "ok",
   "ollama": { "version": "0.5.4" },
-  "ollama_url": "http://127.0.0.1:11434"
+  "ollama_url": "http://127.0.0.1:11434",
+  "lmstudio": { "models": 5, "loaded": 1 },
+  "lmstudio_url": "http://127.0.0.1:1234"
 }
 ```
 
-**Response (503):** Ollama unreachable.
+**Response (200, one online):** Same shape; unreachable backend fields are `null` with optional `*_error` strings.
+
+**Response (503):** Both backends unreachable.
 
 ---
 
 ### `GET /api/models`
 
-Lists installed Ollama models (sorted by name).
+Lists LLM models from all reachable backends (sorted by provider, then name). Partial success is allowed — if one backend is offline, models from the other are still returned.
 
 **Response:**
 ```json
@@ -848,15 +989,30 @@ Lists installed Ollama models (sorted by name).
   "models": [
     {
       "name": "llama3.2:latest",
+      "provider": "ollama",
+      "display_name": "llama3.2:latest",
       "size": 2019393189,
-      "digest": "sha256:...",
       "details": {
         "parameter_size": "3.2B",
         "quantization_level": "Q4_K_M",
         "family": "llama"
-      }
+      },
+      "digest": "sha256:..."
+    },
+    {
+      "name": "qwen/qwen3.6-35b-a3b",
+      "provider": "lmstudio",
+      "display_name": "Qwen3.6-35B-A3B",
+      "size": 21474836480,
+      "details": {
+        "parameter_size": "35B",
+        "quantization_level": "Q4_K_M",
+        "family": "qwen3_moe"
+      },
+      "loaded": true
     }
-  ]
+  ],
+  "errors": {}
 }
 ```
 
@@ -864,13 +1020,23 @@ Lists installed Ollama models (sorted by name).
 
 ### `GET /api/running`
 
-Proxies Ollama `GET /api/ps` — models currently loaded in memory.
+Lists models currently loaded in memory from **both** backends.
+
+**Response:**
+```json
+{
+  "models": [
+    { "name": "llama3.2:latest", "provider": "ollama", "size": 2019393189 },
+    { "name": "Qwen3.6-35B-A3B", "provider": "lmstudio", "model_id": "qwen/qwen3.6-35b-a3b" }
+  ]
+}
+```
 
 ---
 
 ### `GET /api/system`
 
-Host system stats plus Ollama version.
+Host system stats plus backend status.
 
 **Response:**
 ```json
@@ -882,7 +1048,9 @@ Host system stats plus Ollama version.
   "swap_used_gb": 0.0,
   "cpu_percent": 12.5,
   "cpu_count": 16,
-  "ollama_version": "0.5.4"
+  "ollama_version": "0.5.4",
+  "lmstudio_models": 5,
+  "lmstudio_loaded": 1
 }
 ```
 
@@ -895,6 +1063,7 @@ Runs a benchmark. **Request body:**
 ```json
 {
   "model": "llama3.2:latest",
+  "provider": "ollama",
   "prompt": "Write a short paragraph about local LLM inference.",
   "num_predict": 128,
   "temperature": 0.7,
@@ -904,17 +1073,18 @@ Runs a benchmark. **Request body:**
 
 | Field | Type | Required | Constraints |
 |-------|------|----------|-------------|
-| `model` | string | Yes | Must exist in Ollama |
+| `model` | string | Yes | Must exist for the given provider |
+| `provider` | string | No | `"ollama"` (default) or `"lmstudio"` |
 | `prompt` | string | No | Default provided |
-| `num_predict` | int | No | 1–4096 |
+| `num_predict` | int | No | 1–4096 (maps to `max_tokens` for LM Studio) |
 | `temperature` | float | No | 0.0–2.0 |
 | `warmup` | bool | No | Default `true` |
 
-**Response:** Full metrics object (see [Metrics Reference](#10-metrics-reference)) including `insights` for the model.
+**Response:** Full metrics object (see [Metrics Reference](#10-metrics-reference)) including `provider`, `insights` for the provider+model pair.
 
 **Errors:**
-- `404` — Model not found
-- `502` — Ollama request failed
+- `404` — Model not found for provider
+- `502` — Backend request failed
 
 ---
 
@@ -942,10 +1112,11 @@ Clears all stored benchmark history.
 
 **Query params:**
 - `model` (optional) — Filter insights to one model
+- `provider` (optional) — Filter by `"ollama"` or `"lmstudio"` (recommended when using `model`)
 
-**Without `model`:** Returns insights for all models keyed by name.
+**Without `model`:** Returns insights for all provider+model pairs keyed as `provider:model`.
 
-**With `model`:** Returns single-model insights object.
+**With `model` (+ optional `provider`):** Returns single-model insights object.
 
 ---
 
@@ -987,23 +1158,27 @@ flowchart TB
     class Metrics,Response,Details,Insights,Chart,History accent
 ```
 
+The system bar includes **Ollama version**, **LM Studio loaded/models count**, and **loaded models** badges from both backends.
+
 ### UI Sections
 
 | Section | Updates When |
 |---------|--------------|
+| **Connection pill** | On page load (`GET /api/health`) |
 | **System bar** | Every 5 seconds + after benchmark |
 | **Metric cards** | After each benchmark (with color ratings) |
 | **Model response** | After each benchmark |
-| **Insights panel** | On model change + after benchmark |
-| **Chart** | On history load/clear |
-| **History table** | On history load/clear; color-codes generation tok/s |
+| **Model parameters table** | After each benchmark (includes Provider row) |
+| **Insights panel** | On model change + after benchmark (scoped to provider+model) |
+| **Chart** | On history load/clear (labels include provider prefix) |
+| **History table** | On history load/clear; color-codes generation tok/s per provider+model |
 
 ### Connection States
 
 | State | Indicator |
 |-------|-----------|
-| Connected | Green dot, "Ollama connected", Run button enabled |
-| Disconnected | Red dot, "Ollama offline", Run button disabled |
+| One or both connected | Green dot, e.g. "Ollama connected", "LM Studio connected", or "Ollama + LM Studio connected"; Run button enabled if models exist |
+| Both offline | Red dot, "Backends offline", Run button disabled |
 
 ---
 
@@ -1038,8 +1213,10 @@ Defined in `static/app.js`:
 | No authentication | Do not expose to untrusted networks without a reverse proxy |
 | Single concurrent benchmark | Parallel clicks queue on the client (button disabled during run) |
 | Ollama timing accuracy | Depends on Ollama version and backend (CPU/GPU) |
+| LM Studio timing approximation | Prompt/generation phases split proportionally from wall-clock; less precise than Ollama nanosecond fields |
 | No streaming | TTFT is estimated from load + prompt eval, not first streamed chunk |
 | Relative ratings only | Cannot judge if 20 tok/s is "good" without external context |
+| Cross-provider comparison | Ollama and LM Studio metrics are not directly comparable |
 
 ### Best Practices for Reliable Benchmarks
 
@@ -1048,12 +1225,12 @@ Defined in `static/app.js`:
 flowchart TD
     A["Before benchmarking"] --> B["Close unnecessary apps"]
     B --> C["Ensure model fits in RAM"]
-    C --> D["Keep Ollama version constant"]
+    C --> D["Keep backend versions constant"]
     D --> E["Use warmup for throughput tests"]
     E --> F["Fix prompt when comparing parameters"]
     F --> G["Run multiple iterations"]
     G --> H["Record system load conditions"]
-    H --> I["Compare quantizations separately"]
+    H --> I["Compare within same provider"]
 
     classDef surface fill:#121820,stroke:#2a3544,color:#e8edf4
     classDef accent fill:#1a2230,stroke:#76b900,color:#76b900
@@ -1064,10 +1241,12 @@ flowchart TD
 ```
 
 1. **Isolate variables** — Change one parameter at a time.
-2. **Control prompt length** — Longer prompts increase `prompt_eval_duration` and affect overall tok/s.
-3. **Watch `done_reason`** — `length` means you hit `num_predict`; `stop` means natural completion.
+2. **Control prompt length** — Longer prompts increase prompt eval time and affect overall tok/s.
+3. **Watch `done_reason`** — `length` means you hit max tokens; `stop` means natural completion.
 4. **Monitor memory delta** — Large positive deltas may indicate model loading; swap usage degrades speed.
-5. **Document hardware** — Record GPU model, driver, and Ollama `num_gpu` settings externally.
+5. **Document hardware** — Record GPU model, driver, and backend load settings externally.
+6. **LM Studio:** Load the model in LM Studio before benchmarking for consistent load times, or rely on warm-up.
+7. **Compare within provider** — Do not rank Ollama runs against LM Studio runs; runtimes and metric sources differ.
 
 ---
 
@@ -1075,13 +1254,16 @@ flowchart TD
 
 | Symptom | Likely Cause | Solution |
 |---------|--------------|----------|
-| "Ollama offline" | Ollama not running | Run `ollama serve` or start Ollama service |
-| "Model not found" | Model not pulled | `ollama pull <model>` |
+| "Backends offline" | Neither Ollama nor LM Studio reachable | Start at least one backend |
+| "Ollama connected" only | LM Studio server not running | Enable local server in LM Studio Developer tab |
+| "LM Studio connected" only | Ollama not running | Run `ollama serve` |
+| "Model not found" | Model not installed/loaded | `ollama pull <model>` or download model in LM Studio |
+| LM Studio benchmark fails | Model not loaded or wrong key | Load model in LM Studio; verify key via `GET /api/v1/models` |
 | Benchmark timeout | Slow hardware or huge `num_predict` | Reduce max tokens; check GPU offload |
 | Port already in use | Another process on 8765 | `PORT=9000 ./start.sh` |
 | All ratings "expected" | Only one run recorded | Run more benchmarks |
 | Wildly varying tok/s | Thermal throttling, background load | Cool down GPU; reduce system load |
-| Empty response | Model error or context issue | Check `dashboard.log` and Ollama logs |
+| Empty response | Model error or context issue | Check `dashboard.log` and backend logs |
 
 ### Log Locations
 
@@ -1089,15 +1271,28 @@ flowchart TD
 |------|----------|
 | `dashboard.log` | Uvicorn server output |
 | Ollama logs | Platform-specific (journalctl, Console.app, etc.) |
+| LM Studio logs | `~/.lmstudio/server-logs/` |
 
-### Verify Ollama Manually
+### Verify Backends Manually
 
+**Ollama:**
 ```bash
 curl http://127.0.0.1:11434/api/version
 curl http://127.0.0.1:11434/api/tags
 curl http://127.0.0.1:11434/api/generate -d '{
   "model": "llama3.2",
   "prompt": "Hello",
+  "stream": false
+}'
+```
+
+**LM Studio:**
+```bash
+curl http://127.0.0.1:1234/api/v1/models
+curl http://127.0.0.1:1234/v1/completions -H "Content-Type: application/json" -d '{
+  "model": "your-model-key",
+  "prompt": "Hello",
+  "max_tokens": 32,
   "stream": false
 }'
 ```
@@ -1110,6 +1305,7 @@ curl http://127.0.0.1:11434/api/generate -d '{
 
 | Goal | Where to Change |
 |------|-----------------|
+| Add a third inference backend | New provider in `server.py`, normalize models, add benchmark branch |
 | Add inference parameters | `BenchmarkRequest` in `server.py` + UI controls in `index.html` / `app.js` |
 | Persist history | Replace `benchmark_history` list with SQLite/JSON file |
 | Add GPU metrics | Integrate `pynvml` in `_system_snapshot()` |
@@ -1144,13 +1340,15 @@ async def example():
 │  Start:     ./start.sh                                      │
 │  URL:       http://localhost:8765                           │
 │  Ollama:    http://127.0.0.1:11434 (OLLAMA_BASE_URL)        │
+│  LM Studio: http://127.0.0.1:1234 (LMSTUDIO_BASE_URL)       │
+│  Providers: ollama | lmstudio (select via model dropdown)   │
 │  Primary KPI: eval_tokens_per_sec (generation throughput)   │
 │  Key latency: time_to_first_token_s (load + prompt eval)    │
 │  History:   50 runs in memory (cleared on restart)          │
-│  Ratings:   Best / Expected / Poor (relative to your runs)  │
+│  Ratings:   Best / Expected / Poor (per provider + model)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-*Documentation generated for LLM Benchmark Dashboard v1.0.0*
+*Documentation for LLM Benchmark Dashboard v1.0.0 — Ollama and LM Studio support*

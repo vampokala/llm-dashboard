@@ -1,20 +1,27 @@
 # LLM Benchmark Dashboard
 
-A web dashboard for benchmarking **local LLM inference performance** via [Ollama](https://ollama.com). Measure throughput, latency, time-to-first-token, and compare parameter settings across benchmark runs.
+A web dashboard for benchmarking **local LLM inference performance** via [Ollama](https://ollama.com) and [LM Studio](https://lmstudio.ai). Measure throughput, latency, time-to-first-token, and compare parameter settings across benchmark runs — from either backend in one UI.
 
 ![LLM Benchmark Dashboard](docs/dashboard-screenshot.png)
 
 ## Quick Start
 
 ```bash
-# Prerequisites: Ollama running with at least one model
+# Prerequisites: at least one inference backend running with a model available
+
+# Option A — Ollama
 ollama serve
 ollama pull llama3.2
 
-# Start the dashboard
+# Option B — LM Studio
+# Install LM Studio, start the local server (default port 1234), and load a model
+
+# Start the dashboard (works with either or both backends)
 ./start.sh
 # Open http://localhost:8765
 ```
+
+Select a model from the dropdown — entries are labeled `[Ollama]` or `[LM Studio]`. The dashboard connects to whichever backends are online.
 
 ## Dashboard Layout
 
@@ -23,10 +30,10 @@ The UI is organized into a **configuration sidebar** (left) and a **results work
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#1a2230", "primaryTextColor": "#e8edf4", "primaryBorderColor": "#2a3544", "lineColor": "#8b9cb3", "secondaryColor": "#121820", "tertiaryColor": "#0b0f14", "fontSize": "13px"}}}%%
 flowchart TB
-    subgraph Header["Header - Ollama connection status"]
+    subgraph Header["Header - Backend connection status"]
         direction LR
         H1["LLM Benchmark Dashboard"]
-        H2["Ollama connected"]
+        H2["Ollama + LM Studio connected"]
     end
 
     subgraph Workspace["Dashboard workspace"]
@@ -34,7 +41,7 @@ flowchart TB
 
         subgraph Sidebar["Sidebar - Configuration"]
             direction TB
-            S1["Model selector<br/>llama3.3:70b - 70.6B - Q4_K_M"]
+            S1["Model selector<br/>[Ollama] llama3.3:70b or [LM Studio] qwen/..."]
             S2["Prompt presets<br/>Short, Essay, Code, Reasoning"]
             S3["Prompt textarea"]
             S4["Max Tokens and Temperature"]
@@ -52,7 +59,8 @@ flowchart TB
                 M3["CPU"]
                 M4["Swap"]
                 M5["Ollama version"]
-                M6["Loaded Models"]
+                M6["LM Studio loaded / models"]
+                M7["Loaded Models"]
             end
 
             subgraph Metrics["Performance Metrics"]
@@ -92,7 +100,7 @@ flowchart TB
 
     class S1,S2,S3,S4,S5 sidebar
     class S6 action
-    class M1,M2,M3,M4,M5,M6 sysbar
+    class M1,M2,M3,M4,M5,M6,M7 sysbar
     class P1,P3,P4,P5,P6 genMetric
     class P2 promptMetric
     class C1,C2,C3,V1,V2 panel
@@ -101,7 +109,7 @@ flowchart TB
 
 ## Benchmark Flow
 
-From user click to displayed results — green steps are generation-focused, blue steps are prompt/system, gray steps are orchestration.
+From user click to displayed results — green steps are generation-focused, blue steps are prompt/system, gray steps are orchestration. The backend routes to Ollama or LM Studio based on the selected model's provider.
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#1a2230", "primaryTextColor": "#e8edf4", "primaryBorderColor": "#2a3544", "lineColor": "#8b9cb3"}}}%%
@@ -109,7 +117,7 @@ flowchart TD
     Start(["User clicks Run Benchmark"]) --> C1
 
     subgraph Config["1. Configure"]
-        C1["Select model"]
+        C1["Select model and provider"]
         C2["Set prompt and presets"]
         C3["Tune max tokens and temperature"]
     end
@@ -118,27 +126,29 @@ flowchart TD
 
     subgraph API["2. Backend - FastAPI"]
         A1["Capture system snapshot"]
-        A2["Validate model via Ollama"]
+        A2["Validate model for provider"]
         C4{"Warm-up enabled?"}
         A4["Build metrics and insights"]
         A5["Append to history"]
     end
 
     A1 --> A2 --> C4
-    C4 -->|Yes| W1["Warm-up generate<br/>5 tokens, load model"]
-    C4 -->|No| O1
-    W1 --> O1
+    C4 -->|Yes| W1["Warm-up request<br/>5 tokens, load model"]
+    C4 -->|No| P1
+    W1 --> P1
 
-    subgraph Ollama["3. Ollama Inference"]
-        O1["POST /api/generate"]
-        O2["Load model weights"]
-        O3["Prompt evaluation"]
-        O4["Token generation"]
+    subgraph Provider{"3. Inference backend"}
+        direction TB
+        O1["Ollama: POST /api/generate"]
+        L1["LM Studio: POST /v1/completions"]
     end
 
-    A1 --> A2 --> O1
-    O1 --> O2 --> O3 --> O4
-    O4 --> A4 --> A5
+    P1{"Provider?"}
+    P1 -->|ollama| O1
+    P1 -->|lmstudio| L1
+    O1 --> A4
+    L1 --> A4
+    A4 --> A5
 
     subgraph UI["4. Dashboard Update"]
         U1["Metric cards<br/>tok/s, TTFT, load time"]
@@ -154,8 +164,6 @@ flowchart TD
     classDef config fill:#121820,stroke:#2a3544,color:#e8edf4
     classDef backend fill:#1a2230,stroke:#8b9cb3,color:#e8edf4
     classDef warmup fill:#1a2230,stroke:#f0a020,color:#f0a020
-    classDef load fill:#1a2230,stroke:#e05252,color:#e8edf4
-    classDef prompt fill:#1a2230,stroke:#4da3ff,color:#4da3ff
     classDef gen fill:#1a2230,stroke:#76b900,color:#76b900
     classDef display fill:#121820,stroke:#76b900,color:#76b900
     classDef done fill:#76b900,stroke:#5a8f00,color:#0b0f14
@@ -164,9 +172,7 @@ flowchart TD
     class C1,C2,C3 config
     class A1,A2,A4,A5,C4 backend
     class W1 warmup
-    class O2 load
-    class O3 prompt
-    class O1,O4 gen
+    class O1,L1 gen
     class U1,U2,U3,U4 display
     class Done done
 ```
@@ -191,9 +197,15 @@ flowchart LR
     end
 
     subgraph OllamaRT["Ollama port 11434"]
-        API["HTTP API"]
-        Infer["Inference engine"]
-        Models["GGUF models"]
+        OllamaAPI["HTTP API"]
+        OllamaInfer["Inference engine"]
+        OllamaModels["GGUF models"]
+    end
+
+    subgraph LMStudioRT["LM Studio port 1234"]
+        LMSAPI["OpenAI-compatible API"]
+        LMSInfer["Inference engine"]
+        LMSModels["Local models"]
     end
 
     HTML --> JS
@@ -201,17 +213,21 @@ flowchart LR
     FastAPI --> History
     FastAPI --> Insights
     FastAPI --> Psutil
-    FastAPI -->|"httpx async"| API
-    API --> Infer --> Models
+    FastAPI -->|"httpx async"| OllamaAPI
+    FastAPI -->|"httpx async"| LMSAPI
+    OllamaAPI --> OllamaInfer --> OllamaModels
+    LMSAPI --> LMSInfer --> LMSModels
 
     classDef browser fill:#121820,stroke:#4da3ff,color:#4da3ff
     classDef server fill:#1a2230,stroke:#76b900,color:#76b900
     classDef ollama fill:#121820,stroke:#8b9cb3,color:#e8edf4
+    classDef lmstudio fill:#121820,stroke:#f0a020,color:#f0a020
     classDef store fill:#0b0f14,stroke:#2a3544,color:#8b9cb3
 
     class HTML,JS,CSS,Chart browser
     class FastAPI,Insights,Psutil server
-    class API,Infer,Models ollama
+    class OllamaAPI,OllamaInfer,OllamaModels ollama
+    class LMSAPI,LMSInfer,LMSModels lmstudio
     class History store
 ```
 
@@ -223,17 +239,18 @@ Diagrams use the same palette as `static/style.css`. See [DOCUMENTATION.md](./DO
 |-------|-----|----------|
 | Green | `#76b900` | Generation speed, primary actions, success |
 | Blue | `#4da3ff` | Prompt speed, system bar, user interaction |
-| Amber | `#f0a020` | Warm-up phase |
+| Amber | `#f0a020` | Warm-up phase, LM Studio nodes |
 | Red | `#e05252` | Model load step, errors |
 | Dark surface | `#121820` / `#1a2230` | Panels and cards |
 | Muted text | `#8b9cb3` | Labels and secondary info |
 
 ## Features
 
+- Benchmark models from **Ollama** or **LM Studio** in a single dashboard
 - Run controlled generation benchmarks with configurable prompts and parameters
 - View generation speed, prompt speed, load time, and time-to-first-token
-- Monitor host CPU, memory, and loaded Ollama models
-- Track benchmark history with charts and comparative insights
+- Monitor host CPU, memory, and loaded models from both backends
+- Track benchmark history with charts and comparative insights (scoped per provider + model)
 - Rate performance relative to your own runs (Best / Expected / Poor)
 
 ## Documentation
@@ -243,6 +260,7 @@ Diagrams use the same palette as `static/style.css`. See [DOCUMENTATION.md](./DO
 The comprehensive guide covers:
 
 - Architecture and Mermaid diagrams (flow, sequence, component)
+- Ollama and LM Studio benchmark paths and metric derivation
 - LLM performance evaluation methodology
 - All metrics, parameters, and evaluation criteria
 - REST API reference
@@ -253,11 +271,14 @@ The comprehensive guide covers:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama API URL |
+| `LMSTUDIO_BASE_URL` | `http://127.0.0.1:1234` | LM Studio local server URL |
 | `PORT` | `8765` | Dashboard port (`start.sh`) |
+
+At least one backend must be reachable. Both can run simultaneously — the model dropdown merges LLM models from each provider.
 
 ## Stack
 
-Python · FastAPI · Uvicorn · httpx · psutil · Vanilla JS · Chart.js · Ollama
+Python · FastAPI · Uvicorn · httpx · psutil · Vanilla JS · Chart.js · Ollama · LM Studio
 
 ## License
 
