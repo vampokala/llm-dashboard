@@ -137,7 +137,7 @@ flowchart TD
     C4 -->|No| P1
     W1 --> P1
 
-    subgraph Provider{"3. Inference backend"}
+    subgraph Provider["3. Inference backend"]
         direction TB
         O1["Ollama: POST /api/generate"]
         L1["LM Studio: POST /v1/completions"]

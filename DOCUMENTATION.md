@@ -380,7 +380,7 @@ sequenceDiagram
     participant UI as app.js
     participant API as FastAPI
     participant PS as psutil
-    participant Backend as Ollama or LM Studio
+    participant Backend as "Ollama or LM Studio"
 
     User->>UI: Click Run Benchmark
     UI->>UI: Show loading overlay
@@ -389,12 +389,8 @@ sequenceDiagram
     API->>PS: system snapshot before
     API->>API: validate model for provider
 
-    alt warmup enabled
-        alt provider ollama
-            API->>Backend: POST /api/generate num_predict 5
-        else provider lmstudio
-            API->>Backend: POST /v1/completions max_tokens 5
-        end
+    opt warmup enabled
+        API->>Backend: POST warm-up request (5 tokens)
         Backend-->>API: warmup result
     end
 
@@ -429,7 +425,7 @@ sequenceDiagram
     participant Browser
     participant API as FastAPI
     participant Ollama
-    participant LMS as LM Studio
+    participant LMS as "LM Studio"
 
     Browser->>API: GET /
     API-->>Browser: index.html
